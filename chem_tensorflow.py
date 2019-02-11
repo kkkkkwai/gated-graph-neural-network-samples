@@ -10,7 +10,7 @@ import numpy as np
 import pickle
 import random
 
-from utils import MLP, ThreadedIterator, SMALL_NUMBER
+from utils import MLP, ThreadedIterator, SMALL_NUMBER, EDGE_TYPE
 
 
 class ChemModel(object):
@@ -23,24 +23,28 @@ class ChemModel(object):
             'clamp_gradient_norm': 1.0,
             'out_layer_dropout_keep_prob': 1.0,
 
+            'word_embedding_size': 100,
+            'type_embedding_size': 100,
+            'max_node_length': 100,
             'hidden_size': 100,
             'num_timesteps': 4,
             'use_graph': True,
 
-            'tie_fwd_bkwd': True,
+            'tie_fwd_bkwd': False,
             'task_ids': [0],
 
             'random_seed': 0,
 
-            'train_file': 'molecules_train.json',
-            'valid_file': 'molecules_valid.json'
+            'train_dir': 'graphs-train',
+            'valid_dir': 'graphs-valid',
+            'type': 'typehierarchy'
         }
 
     def __init__(self, args):
         self.args = args
 
         # Collect argument things:
-        data_dir = ''
+        data_dir = 'data'
         if '--data_dir' in args and args['--data_dir'] is not None:
             data_dir = args['--data_dir']
         self.data_dir = data_dir
@@ -66,13 +70,15 @@ class ChemModel(object):
         random.seed(params['random_seed'])
         np.random.seed(params['random_seed'])
 
-
         # Load data:
-        self.max_num_vertices = 0
         self.num_edge_types = 0
         self.annotation_size = 0
-        self.train_data = self.load_data(params['train_file'], is_training_data=True)
-        self.valid_data = self.load_data(params['valid_file'], is_training_data=False)
+        self.type_hierarchy = []
+        self.vocab = []
+        self.train_data = self.load_data(params['train_dir'], is_training_data=True)
+        self.valid_data = self.load_data(params['valid_dir'], is_training_data=False)
+        if not self.params['tie_fwd_bkwd']:
+            self.num_edge_types = self.num_edge_types*2
 
         # Build the actual model
         config = tf.ConfigProto()
@@ -94,26 +100,34 @@ class ChemModel(object):
             else:
                 self.initialize_model()
 
-    def load_data(self, file_name, is_training_data: bool):
-        full_path = os.path.join(self.data_dir, file_name)
+    def load_data(self, dir_name, is_training_data: bool):
+        # TODO: iterate through all sub-directories
+        type_path = os.path.join(self.data_dir, 'benchmarkdotnet', 'benchmarkdotnet-typehierarchy.json')
+        full_path = os.path.join(self.data_dir, 'benchmarkdotnet', 'graphs-train', 'benchmarkdotnet.0')
 
         print("Loading data from %s" % full_path)
+
+        self.num_edge_types = len(EDGE_TYPE)
+
+        # Load type information
+        if is_training_data:
+            with open(type_path, 'r') as f:
+                self.type_hierarchy.append(json.load(f))
+
+        # Load data. Test for small only
         with open(full_path, 'r') as f:
-            data = json.load(f)
+            if is_training_data:
+                data = json.load(f)[:10]
+            else:
+                data = json.load(f)[10:15]
 
         restrict = self.args.get("--restrict_data")
         if restrict is not None and restrict > 0:
             data = data[:restrict]
 
-        # Get some common data out:
-        num_fwd_edge_types = 0
-        for g in data:
-            self.max_num_vertices = max(self.max_num_vertices, max([v for e in g['graph'] for v in [e[0], e[2]]]))
-            num_fwd_edge_types = max(num_fwd_edge_types, max([e[1] for e in g['graph']]))
-        self.num_edge_types = max(self.num_edge_types, num_fwd_edge_types * (1 if self.params['tie_fwd_bkwd'] else 2))
-        self.annotation_size = max(self.annotation_size, len(data[0]["node_features"][0]))
-
         return self.process_raw_graphs(data, is_training_data)
+
+    # def load_vocab(self, ):
 
     @staticmethod
     def graph_string_to_array(graph_string: str) -> List[List[int]]:
@@ -124,12 +138,13 @@ class ChemModel(object):
         raise Exception("Models have to implement process_raw_graphs!")
 
     def make_model(self):
-        self.placeholders['target_values'] = tf.placeholder(tf.float32, [len(self.params['task_ids']), None],
+        self.placeholders['target_values'] = tf.placeholder(tf.float32, [None],
                                                             name='target_values')
-        self.placeholders['target_mask'] = tf.placeholder(tf.float32, [len(self.params['task_ids']), None],
+        self.placeholders['target_mask'] = tf.placeholder(tf.float32, [None],
                                                           name='target_mask')
         self.placeholders['num_graphs'] = tf.placeholder(tf.int32, [], name='num_graphs')
-        self.placeholders['out_layer_dropout_keep_prob'] = tf.placeholder(tf.float32, [], name='out_layer_dropout_keep_prob')
+        self.placeholders['out_layer_dropout_keep_prob'] = tf.placeholder(tf.float32, [],
+                                                                          name='out_layer_dropout_keep_prob')
 
         with tf.variable_scope("graph_model"):
             self.prepare_specific_graph_model()
@@ -137,26 +152,23 @@ class ChemModel(object):
             if self.params['use_graph']:
                 self.ops['final_node_representations'] = self.compute_final_node_representations()
             else:
-                self.ops['final_node_representations'] = tf.zeros_like(self.placeholders['initial_node_representation'])
+                # TODO: to be modified
+                pass
+                # self.ops['final_node_representations'] = tf.zeros_like(self.placeholders['initial_node_representation'])
 
         self.ops['losses'] = []
         for (internal_id, task_id) in enumerate(self.params['task_ids']):
             with tf.variable_scope("out_layer_task%i" % task_id):
-                with tf.variable_scope("regression_gate"):
-                    self.weights['regression_gate_task%i' % task_id] = MLP(2 * self.params['hidden_size'], 1, [],
-                                                                           self.placeholders['out_layer_dropout_keep_prob'])
                 with tf.variable_scope("regression"):
-                    self.weights['regression_transform_task%i' % task_id] = MLP(self.params['hidden_size'], 1, [],
-                                                                                self.placeholders['out_layer_dropout_keep_prob'])
-                computed_values = self.gated_regression(self.ops['final_node_representations'],
-                                                        self.weights['regression_gate_task%i' % task_id],
-                                                        self.weights['regression_transform_task%i' % task_id])
-                diff = computed_values - self.placeholders['target_values'][internal_id,:]
-                task_target_mask = self.placeholders['target_mask'][internal_id,:]
-                task_target_num = tf.reduce_sum(task_target_mask) + SMALL_NUMBER
-                diff = diff * task_target_mask  # Mask out unused values
-                self.ops['accuracy_task%i' % task_id] = tf.reduce_sum(tf.abs(diff)) / task_target_num
-                task_loss = tf.reduce_sum(0.5 * tf.square(diff)) / task_target_num
+                    self.weights['regression_transform_task%i' % task_id] = MLP(2 * self.params['hidden_size'], 1, [],
+                                                                                self.placeholders[
+                                                                                    'out_layer_dropout_keep_prob'])
+                accuracy, task_loss = self.regression(self.ops['final_node_representations'],
+                                                      self.weights['regression_transform_task%i' % task_id])
+                # task_target_mask = self.placeholders['target_mask'][internal_id, :]
+                # task_target_num = tf.reduce_sum(task_target_mask) + SMALL_NUMBER
+                # diff = diff * task_target_mask  # Mask out unused values
+                self.ops['accuracy_task%i' % task_id] = accuracy
                 # Normalise loss to account for fewer task-specific examples in batch:
                 task_loss = task_loss * (1.0 / (self.params['task_sample_ratios'].get(task_id) or 1.0))
                 self.ops['losses'].append(task_loss)
@@ -185,7 +197,7 @@ class ChemModel(object):
         # Initialize newly-introduced variables:
         self.sess.run(tf.local_variables_initializer())
 
-    def gated_regression(self, last_h, regression_gate, regression_transform):
+    def regression(self, last_h, regression_transform):
         raise Exception("Models have to implement gated_regression!")
 
     def prepare_specific_graph_model(self) -> None:
@@ -212,7 +224,8 @@ class ChemModel(object):
             num_graphs = batch_data[self.placeholders['num_graphs']]
             processed_graphs += num_graphs
             if is_training:
-                batch_data[self.placeholders['out_layer_dropout_keep_prob']] = self.params['out_layer_dropout_keep_prob']
+                batch_data[self.placeholders['out_layer_dropout_keep_prob']] = self.params[
+                    'out_layer_dropout_keep_prob']
                 fetch_list = [self.ops['loss'], accuracy_ops, self.ops['train_step']]
             else:
                 batch_data[self.placeholders['out_layer_dropout_keep_prob']] = 1.0
@@ -278,11 +291,13 @@ class ChemModel(object):
                 val_acc = np.sum(valid_accs)  # type: float
                 if val_acc < best_val_acc:
                     self.save_model(self.best_model_file)
-                    print("  (Best epoch so far, cum. val. acc decreased to %.5f from %.5f. Saving to '%s')" % (val_acc, best_val_acc, self.best_model_file))
+                    print("  (Best epoch so far, cum. val. acc decreased to %.5f from %.5f. Saving to '%s')" % (
+                    val_acc, best_val_acc, self.best_model_file))
                     best_val_acc = val_acc
                     best_val_acc_epoch = epoch
                 elif epoch - best_val_acc_epoch >= self.params['patience']:
-                    print("Stopping training after %i epochs without improvement on validation accuracy." % self.params['patience'])
+                    print("Stopping training after %i epochs without improvement on validation accuracy." % self.params[
+                        'patience'])
                     break
 
     def save_model(self, path: str) -> None:
@@ -292,9 +307,9 @@ class ChemModel(object):
             weights_to_save[variable.name] = self.sess.run(variable)
 
         data_to_save = {
-                         "params": self.params,
-                         "weights": weights_to_save
-                       }
+            "params": self.params,
+            "weights": weights_to_save
+        }
 
         with open(path, 'wb') as out_file:
             pickle.dump(data_to_save, out_file, pickle.HIGHEST_PROTOCOL)

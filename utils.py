@@ -7,6 +7,9 @@ import threading
 
 SMALL_NUMBER = 1e-7
 
+EDGE_TYPE = ['Child', 'NextToken', 'LastUse', 'LastWrite', 'ComputedFrom', 'LastLexicalUse', 'ReturnsTo',
+             'FormalArgName', 'GuardedBy', 'GuardedByNegation']
+
 
 def glorot_init(shape):
     initialization_range = np.sqrt(6.0 / (shape[-2] + shape[-1]))

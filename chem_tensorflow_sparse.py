@@ -20,15 +20,15 @@ import numpy as np
 import tensorflow as tf
 import sys, traceback
 import pdb
+import re
 
 from chem_tensorflow import ChemModel
-from utils import glorot_init, SMALL_NUMBER
-
+from utils import glorot_init, SMALL_NUMBER, EDGE_TYPE
 
 GGNNWeights = namedtuple('GGNNWeights', ['edge_weights',
                                          'edge_biases',
                                          'edge_type_attention_weights',
-                                         'rnn_cells',])
+                                         'rnn_cells', ])
 
 
 class SparseGGNNChemModel(ChemModel):
@@ -39,16 +39,15 @@ class SparseGGNNChemModel(ChemModel):
     def default_params(cls):
         params = dict(super().default_params())
         params.update({
-            'batch_size': 100000,
+            'batch_size': 1,
             'use_edge_bias': False,
             'use_propagation_attention': False,
             'use_edge_msg_avg_aggregation': True,
             'residual_connections': {  # For layer i, specify list of layers whose output is added as an input
-                                     "2": [0],
-                                     "4": [0, 2]
-                                    },
 
-            'layer_timesteps': [2, 2, 1, 2, 1],  # number of layers & propagation steps per layer
+            },
+
+            'layer_timesteps': [8],  # number of layers & propagation steps per layer
 
             'graph_rnn_cell': 'GRU',  # GRU, CudnnCompatibleGRUCell, or RNN
             'graph_rnn_activation': 'tanh',  # tanh, ReLU
@@ -59,16 +58,23 @@ class SparseGGNNChemModel(ChemModel):
         return params
 
     def prepare_specific_graph_model(self) -> None:
+        word_dim = self.params['word_embedding_size']
+        type_dim = self.params['type_embedding_size']
         h_dim = self.params['hidden_size']
-        self.placeholders['initial_node_representation'] = tf.placeholder(tf.float32, [None, h_dim],
-                                                                          name='node_features')
+        self.placeholders['initial_word_ids'] = tf.placeholder(tf.int32, [None, self.params['max_node_length']], name='word_ids')
+        self.placeholders['initial_type_ids'] = tf.placeholder(tf.int32, [None, self.params['max_node_length']], name='type_ids')
+        self.placeholders['candidates'] = tf.placeholder(tf.float32, [None, 1], name='candidates')
+        self.placeholders['slots'] = tf.placeholder(tf.int32, [None], name='slots')
+        self.placeholders['num_candidates_per_graph'] = tf.placeholder(tf.int32, [self.params['batch_size']],
+                                                                       name='num_candidates')
         self.placeholders['adjacency_lists'] = [tf.placeholder(tf.int32, [None, 2], name='adjacency_e%s' % e)
                                                 for e in range(self.num_edge_types)]
         self.placeholders['num_incoming_edges_per_type'] = tf.placeholder(tf.float32, [None, self.num_edge_types],
                                                                           name='num_incoming_edges_per_type')
         self.placeholders['graph_nodes_list'] = tf.placeholder(tf.int32, [None], name='graph_nodes_list')
         self.placeholders['graph_state_keep_prob'] = tf.placeholder(tf.float32, None, name='graph_state_keep_prob')
-        self.placeholders['edge_weight_dropout_keep_prob'] = tf.placeholder(tf.float32, None, name='edge_weight_dropout_keep_prob')
+        self.placeholders['edge_weight_dropout_keep_prob'] = tf.placeholder(tf.float32, None,
+                                                                            name='edge_weight_dropout_keep_prob')
 
         activation_name = self.params['graph_rnn_activation'].lower()
         if activation_name == 'tanh':
@@ -77,6 +83,13 @@ class SparseGGNNChemModel(ChemModel):
             activation_fun = tf.nn.relu
         else:
             raise Exception("Unknown activation function type '%s'." % activation_name)
+
+        # create embeddings
+        with tf.variable_scope('embedding_layers'):
+            self.word_embedding = tf.Variable(glorot_init([len(self.vocab), word_dim]), name='word_embed')
+            self.type_embedding = tf.Variable(glorot_init([len(self.type_hierarchy[0]['types']) + 1, type_dim]), name='type_embed')
+            self.init_node_weights = tf.Variable(glorot_init([word_dim + type_dim + 1, h_dim]), name='embed_layer_w')
+            self.init_node_bias = tf.Variable(np.zeros([h_dim]), name='embed_layer_b', dtype=tf.float32)
 
         # Generate per-layer values for edge weights, biases and gated units:
         self.weights = {}  # Used by super-class to place generic things
@@ -90,18 +103,20 @@ class SparseGGNNChemModel(ChemModel):
                 self.gnn_weights.edge_weights.append(edge_weights)
 
                 if self.params['use_propagation_attention']:
-                    self.gnn_weights.edge_type_attention_weights.append(tf.Variable(np.ones([self.num_edge_types], dtype=np.float32),
-                                                                                    name='edge_type_attention_weights_%i' % layer_idx))
+                    self.gnn_weights.edge_type_attention_weights.append(
+                        tf.Variable(np.ones([self.num_edge_types], dtype=np.float32),
+                                    name='edge_type_attention_weights_%i' % layer_idx))
 
                 if self.params['use_edge_bias']:
-                    self.gnn_weights.edge_biases.append(tf.Variable(np.zeros([self.num_edge_types, h_dim], dtype=np.float32),
-                                                                    name='gnn_edge_biases_%i' % layer_idx))
+                    self.gnn_weights.edge_biases.append(
+                        tf.Variable(np.zeros([self.num_edge_types, h_dim], dtype=np.float32),
+                                    name='gnn_edge_biases_%i' % layer_idx))
 
                 cell_type = self.params['graph_rnn_cell'].lower()
                 if cell_type == 'gru':
                     cell = tf.nn.rnn_cell.GRUCell(h_dim, activation=activation_fun)
                 elif cell_type == 'cudnncompatiblegrucell':
-                    assert(activation_name == 'tanh')
+                    assert (activation_name == 'tanh')
                     import tensorflow.contrib.cudnn_rnn as cudnn_rnn
                     cell = cudnn_rnn.CudnnCompatibleGRUCell(h_dim)
                 elif cell_type == 'rnn':
@@ -113,9 +128,19 @@ class SparseGGNNChemModel(ChemModel):
                 self.gnn_weights.rnn_cells.append(cell)
 
     def compute_final_node_representations(self) -> tf.Tensor:
+
+        # get the embeddings and compute initial node representation
+        with tf.variable_scope('embedding_layers'):
+            word_embed = tf.nn.embedding_lookup(params=self.word_embedding, ids=self.placeholders['initial_word_ids'])
+            word_embed = tf.reduce_mean(word_embed, axis=1)
+            type_embed = tf.nn.embedding_lookup(params=self.type_embedding, ids=self.placeholders['initial_type_ids'])
+            type_embed = tf.reduce_max(type_embed, axis=1)
+            initial_node_representation = tf.concat([word_embed, type_embed, self.placeholders['candidates']], axis=1)
+            initial_node_representation = tf.matmul(initial_node_representation, self.init_node_weights) + self.init_node_bias
+
         node_states_per_layer = []  # one entry per layer (final state of that layer), shape: number of nodes in batch v x D
-        node_states_per_layer.append(self.placeholders['initial_node_representation'])
-        num_nodes = tf.shape(self.placeholders['initial_node_representation'], out_type=tf.int32)[0]
+        node_states_per_layer.append(initial_node_representation)
+        num_nodes = tf.shape(self.placeholders['initial_word_ids'], out_type=tf.int32)[0]
 
         message_targets = []  # list of tensors of message targets of shape [E]
         message_edge_types = []  # list of tensors of edge type of shape [E]
@@ -143,8 +168,9 @@ class SparseGGNNChemModel(ChemModel):
                                              for residual_layer_idx in layer_residual_connections]
 
                 if self.params['use_propagation_attention']:
-                    message_edge_type_factors = tf.nn.embedding_lookup(params=self.gnn_weights.edge_type_attention_weights[layer_idx],
-                                                                       ids=message_edge_types)  # Shape [M]
+                    message_edge_type_factors = tf.nn.embedding_lookup(
+                        params=self.gnn_weights.edge_type_attention_weights[layer_idx],
+                        ids=message_edge_types)  # Shape [M]
 
                 # Record new states for this layer. Initialised to last state, but will be updated below:
                 node_states_per_layer.append(node_states_per_layer[-1])
@@ -154,12 +180,14 @@ class SparseGGNNChemModel(ChemModel):
                         message_source_states = []  # list of tensors of edge source states of shape [E, D]
 
                         # Collect incoming messages per edge type
-                        for edge_type_idx, adjacency_list_for_edge_type in enumerate(self.placeholders['adjacency_lists']):
+                        for edge_type_idx, adjacency_list_for_edge_type in enumerate(
+                                self.placeholders['adjacency_lists']):
                             edge_sources = adjacency_list_for_edge_type[:, 0]
                             edge_source_states = tf.nn.embedding_lookup(params=node_states_per_layer[-1],
                                                                         ids=edge_sources)  # Shape [E, D]
                             all_messages_for_edge_type = tf.matmul(edge_source_states,
-                                                                   self.gnn_weights.edge_weights[layer_idx][edge_type_idx])  # Shape [E, D]
+                                                                   self.gnn_weights.edge_weights[layer_idx][
+                                                                       edge_type_idx])  # Shape [E, D]
                             messages.append(all_messages_for_edge_type)
                             message_source_states.append(edge_source_states)
 
@@ -169,27 +197,33 @@ class SparseGGNNChemModel(ChemModel):
                             message_source_states = tf.concat(message_source_states, axis=0)  # Shape [M, D]
                             message_target_states = tf.nn.embedding_lookup(params=node_states_per_layer[-1],
                                                                            ids=message_targets)  # Shape [M, D]
-                            message_attention_scores = tf.einsum('mi,mi->m', message_source_states, message_target_states)  # Shape [M]
+                            message_attention_scores = tf.einsum('mi,mi->m', message_source_states,
+                                                                 message_target_states)  # Shape [M]
                             message_attention_scores = message_attention_scores * message_edge_type_factors
 
                             # The following is softmax-ing over the incoming messages per node.
                             # As the number of incoming varies, we can't just use tf.softmax. Reimplement with logsumexp trick:
                             # Step (1): Obtain shift constant as max of messages going into a node
-                            message_attention_score_max_per_target = tf.unsorted_segment_max(data=message_attention_scores,
-                                                                                             segment_ids=message_targets,
-                                                                                             num_segments=num_nodes)  # Shape [V]
+                            message_attention_score_max_per_target = tf.unsorted_segment_max(
+                                data=message_attention_scores,
+                                segment_ids=message_targets,
+                                num_segments=num_nodes)  # Shape [V]
                             # Step (2): Distribute max out to the corresponding messages again, and shift scores:
-                            message_attention_score_max_per_message = tf.gather(params=message_attention_score_max_per_target,
-                                                                                indices=message_targets)  # Shape [M]
+                            message_attention_score_max_per_message = tf.gather(
+                                params=message_attention_score_max_per_target,
+                                indices=message_targets)  # Shape [M]
                             message_attention_scores -= message_attention_score_max_per_message
                             # Step (3): Exp, sum up per target, compute exp(score) / exp(sum) as attention prob:
                             message_attention_scores_exped = tf.exp(message_attention_scores)  # Shape [M]
-                            message_attention_score_sum_per_target = tf.unsorted_segment_sum(data=message_attention_scores_exped,
-                                                                                             segment_ids=message_targets,
-                                                                                             num_segments=num_nodes)  # Shape [V]
-                            message_attention_normalisation_sum_per_message = tf.gather(params=message_attention_score_sum_per_target,
-                                                                                        indices=message_targets)  # Shape [M]
-                            message_attention = message_attention_scores_exped / (message_attention_normalisation_sum_per_message + SMALL_NUMBER)  # Shape [M]
+                            message_attention_score_sum_per_target = tf.unsorted_segment_sum(
+                                data=message_attention_scores_exped,
+                                segment_ids=message_targets,
+                                num_segments=num_nodes)  # Shape [V]
+                            message_attention_normalisation_sum_per_message = tf.gather(
+                                params=message_attention_score_sum_per_target,
+                                indices=message_targets)  # Shape [M]
+                            message_attention = message_attention_scores_exped / (
+                                        message_attention_normalisation_sum_per_message + SMALL_NUMBER)  # Shape [M]
                             # Step (4): Weigh messages using the attention prob:
                             messages = messages * tf.expand_dims(message_attention, -1)
 
@@ -211,30 +245,57 @@ class SparseGGNNChemModel(ChemModel):
 
                         # pass updated vertex features into RNN cell
                         node_states_per_layer[-1] = self.gnn_weights.rnn_cells[layer_idx](incoming_information,
-                                                                                          node_states_per_layer[-1])[1]  # Shape [V, D]
+                                                                                          node_states_per_layer[-1])[
+                            1]  # Shape [V, D]
 
         return node_states_per_layer[-1]
 
-    def gated_regression(self, last_h, regression_gate, regression_transform):
+    def regression(self, last_h, regression_transform):
         # last_h: [v x h]
-        gate_input = tf.concat([last_h, self.placeholders['initial_node_representation']], axis=-1)  # [v x 2h]
-        gated_outputs = tf.nn.sigmoid(regression_gate(gate_input)) * regression_transform(last_h)  # [v x 1]
+        candidate_ids = tf.squeeze(tf.where(tf.greater(tf.squeeze(self.placeholders['candidates']), 0)))
+        slot_ids = self.placeholders['slots']
+        context = tf.gather(params=last_h, indices=slot_ids)
+        usage = tf.gather(params=last_h, indices=candidate_ids)
+        segments = tf.gather(params=self.placeholders['graph_nodes_list'], indices=candidate_ids)
 
-        # Sum up all nodes per-graph
-        graph_representations = tf.unsorted_segment_sum(data=gated_outputs,
-                                                        segment_ids=self.placeholders['graph_nodes_list'],
-                                                        num_segments=self.placeholders['num_graphs'])  # [g x 1]
-        return tf.squeeze(graph_representations)  # [g]
+        final_node_states = tf.concat([context, usage], axis=1)
+        outputs = tf.squeeze(regression_transform(final_node_states))
+        splits = tf.stack(tf.split(value=outputs, num_or_size_splits=self.placeholders['num_candidates_per_graph']))
+
+        targets = self.placeholders['target_values']
+        targets_ = tf.stack(tf.split(value=targets, num_or_size_splits=self.placeholders['num_candidates_per_graph']))
+
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(splits, axis=1), tf.argmax(targets_, axis=1)), tf.float32))
+        # loss = tf.stack(tf.split(value=tf.losses.hinge_loss(targets, outputs, reduction=tf.losses.Reduction.NONE),
+        #                          num_or_size_splits=self.placeholders['num_candidates_per_graph']))
+        # loss = tf.reduce_mean(tf.reduce_mean(tf.squeeze(loss), axis=1))
+        # TODO: separate segments
+        # loss = tf.reduce_mean(tf.losses.hinge_loss(targets_, splits), axis=0)
+        loss = tf.losses.hinge_loss(targets, outputs)
+
+        return accuracy, loss  # [g]
 
     # ----- Data preprocessing and chunking into minibatches:
     def process_raw_graphs(self, raw_data: Sequence[Any], is_training_data: bool) -> Any:
         processed_graphs = []
         for d in raw_data:
-            (adjacency_lists, num_incoming_edge_per_type) = self.__graph_to_adjacency_lists(d['graph'])
+            slot = d['SlotDummyNode']
+            num_nodes = len(d['ContextGraph']['NodeLabels'])
+            (adjacency_lists, num_incoming_edge_per_type) = self.__graph_to_adjacency_lists(d['ContextGraph']['Edges'])
+            node_words, node_types = self.__node_preprocess(d['ContextGraph']['NodeLabels'],
+                                                            d['ContextGraph']['NodeTypes'], num_nodes)
+            candidates, target = self.__candidate_preprocess(d['SymbolCandidates'], num_nodes)
+
+            assert num_nodes == len(node_words), "%i   %i"%(num_nodes, len(node_words))
+            assert num_nodes == len(node_types)
             processed_graphs.append({"adjacency_lists": adjacency_lists,
                                      "num_incoming_edge_per_type": num_incoming_edge_per_type,
-                                     "init": d["node_features"],
-                                     "labels": [d["targets"][task_id][0] for task_id in self.params['task_ids']]})
+                                     "node_labels": node_words,
+                                     "node_types": node_types,
+                                     "slot": slot,
+                                     "candidates": candidates,
+                                     "num_candidates": len(d['SymbolCandidates']),
+                                     "target": target})
 
         if is_training_data:
             np.random.shuffle(processed_graphs)
@@ -250,13 +311,16 @@ class SparseGGNNChemModel(ChemModel):
     def __graph_to_adjacency_lists(self, graph) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict[int, int]]]:
         adj_lists = defaultdict(list)
         num_incoming_edges_dicts_per_type = defaultdict(lambda: defaultdict(lambda: 0))
-        for src, e, dest in graph:
-            fwd_edge_type = e - 1  # Make edges start from 0
-            adj_lists[fwd_edge_type].append((src, dest))
-            num_incoming_edges_dicts_per_type[fwd_edge_type][dest] += 1
-            if self.params['tie_fwd_bkwd']:
-                adj_lists[fwd_edge_type].append((dest, src))
-                num_incoming_edges_dicts_per_type[fwd_edge_type][src] += 1
+        for e_id, e_type in enumerate(EDGE_TYPE):
+            if e_type in graph:
+                # TODO: simplify the process
+                for src, dest in graph[e_type]:
+                    fwd_edge_type = e_id  # Make edges start from 0
+                    adj_lists[fwd_edge_type].append((src, dest))
+                    num_incoming_edges_dicts_per_type[fwd_edge_type][dest] += 1
+                    if self.params['tie_fwd_bkwd']:
+                        adj_lists[fwd_edge_type].append((dest, src))
+                        num_incoming_edges_dicts_per_type[fwd_edge_type][src] += 1
 
         final_adj_lists = {e: np.array(sorted(lm), dtype=np.int32)
                            for e, lm in adj_lists.items()}
@@ -271,6 +335,47 @@ class SparseGGNNChemModel(ChemModel):
 
         return final_adj_lists, num_incoming_edges_dicts_per_type
 
+    # extract word and type information from the node
+    def __node_preprocess(self, labels, types, num_nodes):
+        # TODO: handle negative ids
+        node_words = np.full([num_nodes, self.params['max_node_length']], fill_value=0)
+        node_types = np.full([num_nodes, self.params['max_node_length']], fill_value=0)
+        # labels.pop(str(slot), None)
+        for k, v in labels.items():
+            # split tokens and get index
+            # node_words.append([])
+            if v.find('_') is not -1:
+                word_list = v.split('_')
+            else:
+                word_list = list(filter(None, re.split(r'([A-Z][a-z]*)', v)))
+            for idx, w in enumerate(word_list):
+                if w not in self.vocab:
+                    self.vocab.append(w)
+                node_words[int(k)][idx] = self.vocab.index(w)
+            # get type index
+            if k in types and types[k] in self.type_hierarchy[0]['types']:
+                type_idx = self.type_hierarchy[0]['types'].index(types[k])
+                # node_types.append([type_idx])
+                node_types[int(k)][0] = type_idx
+                for idx, t in enumerate(self.type_hierarchy[0]['outgoingEdges'][type_idx]):
+                    node_types[int(k)][idx+1] = t
+            else:
+                # node_types.append([len(self.type_hierarchy[0]['types'])])
+                node_types[int(k)][0] = len(self.type_hierarchy[0]['types'])
+            # pad the ids
+
+        return node_words, node_types
+
+    # extract candidate information
+    def __candidate_preprocess(self, raw_candidates, num_nodes):
+        target = None
+        candidates = np.zeros([num_nodes, 1], dtype=np.int32)
+        for idx, c in enumerate(raw_candidates):
+            if c['IsCorrect']:
+                target = idx
+            candidates[c['SymbolDummyNode']][0] = 1
+        return candidates, target
+
     def make_minibatch_iterator(self, data: Any, is_training: bool):
         """Create minibatches by flattening adjacency matrices into a single adjacency matrix with
         multiple disconnected components."""
@@ -282,7 +387,11 @@ class SparseGGNNChemModel(ChemModel):
         num_graphs = 0
         while num_graphs < len(data):
             num_graphs_in_batch = 0
-            batch_node_features = []
+            batch_node_labels = []
+            batch_node_types = []
+            batch_candidates = []
+            batch_slot = []
+            batch_num_candidates = []
             batch_target_task_values = []
             batch_target_task_mask = []
             batch_adjacency_lists = [[] for _ in range(self.num_edge_types)]
@@ -290,14 +399,19 @@ class SparseGGNNChemModel(ChemModel):
             batch_graph_nodes_list = []
             node_offset = 0
 
-            while num_graphs < len(data) and node_offset + len(data[num_graphs]['init']) < self.params['batch_size']:
+            while num_graphs < len(data) and num_graphs_in_batch < self.params['batch_size']:
                 cur_graph = data[num_graphs]
-                num_nodes_in_graph = len(cur_graph['init'])
-                padded_features = np.pad(cur_graph['init'],
-                                         ((0, 0), (0, self.params['hidden_size'] - self.annotation_size)),
-                                         'constant')
-                batch_node_features.extend(padded_features)
-                batch_graph_nodes_list.append(np.full(shape=[num_nodes_in_graph], fill_value=num_graphs_in_batch, dtype=np.int32))
+                num_nodes_in_graph = len(cur_graph['node_labels'])
+                num_candidates_in_graph = cur_graph['num_candidates']
+                batch_node_labels.extend(cur_graph['node_labels'])
+                batch_node_types.extend(cur_graph['node_types'])
+                batch_candidates.append(cur_graph['candidates'])
+                batch_slot.append(
+                    np.full(shape=[num_candidates_in_graph], fill_value=cur_graph['slot'] + node_offset,
+                            dtype=np.int32))
+                batch_num_candidates.append(num_candidates_in_graph)
+                batch_graph_nodes_list.append(
+                    np.full(shape=[num_nodes_in_graph], fill_value=num_graphs_in_batch, dtype=np.int32))
                 for i in range(self.num_edge_types):
                     if i in cur_graph['adjacency_lists']:
                         batch_adjacency_lists[i].append(cur_graph['adjacency_lists'][i] + node_offset)
@@ -309,27 +423,28 @@ class SparseGGNNChemModel(ChemModel):
                         num_incoming_edges_per_type[node_id, e_type] = edge_count
                 batch_num_incoming_edges_per_type.append(num_incoming_edges_per_type)
 
-                target_task_values = []
-                target_task_mask = []
-                for target_val in cur_graph['labels']:
-                    if target_val is None:  # This is one of the examples we didn't sample...
-                        target_task_values.append(0.)
-                        target_task_mask.append(0.)
-                    else:
-                        target_task_values.append(target_val)
-                        target_task_mask.append(1.)
-                batch_target_task_values.append(target_task_values)
-                batch_target_task_mask.append(target_task_mask)
+                target_one_hot = np.zeros([num_candidates_in_graph], dtype=np.int32)
+                if cur_graph['target'] is None:  # This is one of the examples we didn't sample...
+                    batch_target_task_values.append(target_one_hot)
+                    batch_target_task_mask.append(0.)
+                else:
+                    target_one_hot[cur_graph['target']] = 1
+                    batch_target_task_values.append(target_one_hot)
+                    batch_target_task_mask.append(1.)
                 num_graphs += 1
                 num_graphs_in_batch += 1
                 node_offset += num_nodes_in_graph
-
             batch_feed_dict = {
-                self.placeholders['initial_node_representation']: np.array(batch_node_features),
-                self.placeholders['num_incoming_edges_per_type']: np.concatenate(batch_num_incoming_edges_per_type, axis=0),
+                self.placeholders['initial_word_ids']: np.reshape(np.concatenate(batch_node_labels), [node_offset, self.params['max_node_length']]),
+                self.placeholders['initial_type_ids']: np.reshape(np.concatenate(batch_node_types), [node_offset, self.params['max_node_length']]),
+                self.placeholders['candidates']: np.reshape(np.concatenate(batch_candidates), [node_offset, 1]),
+                self.placeholders['slots']: np.concatenate(batch_slot),
+                self.placeholders['num_candidates_per_graph']: np.array(batch_num_candidates, dtype=np.int32),
+                self.placeholders['num_incoming_edges_per_type']: np.concatenate(batch_num_incoming_edges_per_type,
+                                                                                 axis=0),
                 self.placeholders['graph_nodes_list']: np.concatenate(batch_graph_nodes_list),
-                self.placeholders['target_values']: np.transpose(batch_target_task_values, axes=[1,0]),
-                self.placeholders['target_mask']: np.transpose(batch_target_task_mask, axes=[1, 0]),
+                self.placeholders['target_values']: np.concatenate(batch_target_task_values, axis=0),
+                self.placeholders['target_mask']: np.array(batch_target_task_mask),
                 self.placeholders['num_graphs']: num_graphs_in_batch,
                 self.placeholders['graph_state_keep_prob']: state_dropout_keep_prob,
                 self.placeholders['edge_weight_dropout_keep_prob']: edge_weights_dropout_keep_prob

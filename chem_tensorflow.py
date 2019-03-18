@@ -127,7 +127,10 @@ class ChemModel(object):
 
         return self.process_raw_graphs(data, is_training_data)
 
-    # def load_vocab(self, ):
+    def load_vocab(self, dir_name):
+        train_path = os.path.join(dir_name, 'graphs-test')
+        valid_path = os.path.join(dir_name, 'graphs-valid')
+        test_path = os.path.join(dir_name, 'graphs-test')
 
     @staticmethod
     def graph_string_to_array(graph_string: str) -> List[List[int]]:

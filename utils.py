@@ -9,6 +9,8 @@ SMALL_NUMBER = 1e-7
 
 EDGE_TYPE = ['Child', 'NextToken', 'LastUse', 'LastWrite', 'ComputedFrom', 'LastLexicalUse', 'ReturnsTo',
              'FormalArgName', 'GuardedBy', 'GuardedByNegation']
+seenProjects = ['benchmarkdotnet', 'choco', 'commonmark', 'ninject', 'opserver', 'polly', 'scriptcs']
+unseenProjects = ['automapper', 'commandline', 'humanizer']
 
 
 def glorot_init(shape):
